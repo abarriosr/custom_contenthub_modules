@@ -15,6 +15,10 @@ namespace Drupal\ContentHubUpgradeCommands;
  */
 class ContentHubUpgrade {
 
+  use ContentHubUpgradeProgressTrait;
+
+  const CONTENT_HUB_UPGRADE_PROGRESS_TRACKER_FILE = '/tmp/content-hub-upgrade-progress.tmp';
+
   /**
    * The environment drush alias.
    *
@@ -37,6 +41,27 @@ class ContentHubUpgrade {
   protected $docroot;
 
   /**
+   * Provides Lift Support.
+   *
+   * @var bool
+   */
+  protected $liftSupport = FALSE;
+
+  /**
+   * ContentHubUpgrade constructor.
+   *
+   * @param bool $lift_support
+   *
+   * @throws \Exception
+   */
+  public function __construct($lift_support = FALSE) {
+    $this->liftSupport = $lift_support;
+    $this->getSiteFactorySites();
+    $this->buildProgressTracker();
+    $this->setProgressTrackerFile(self::CONTENT_HUB_UPGRADE_PROGRESS_TRACKER_FILE);
+  }
+
+  /**
    * Collects a list of Site Factory URIs and drush alias.
    */
   protected function getSiteFactorySites() {
@@ -49,6 +74,30 @@ class ContentHubUpgrade {
     $this->docroot = "/var/www/html/{$sites['cloud']['site']}.{$sites['cloud']['env']}/docroot";
   }
 
+  public function buildProgressTracker() {
+    $stages = [
+      'removeRestResourceAndSetSchema',
+      'updateDbs',
+      'upgradePublishers',
+      'runExportQueues',
+      'upgradeSubscribers',
+    ];
+
+    if ($this->liftSupport) {
+      $acquia_lift_support = [
+        'enableAcquiaLiftSupport',
+      ];
+      array_splice( $stages, 2, 0, $acquia_lift_support );
+    }
+    foreach ($stages as $key => $stage) {
+      foreach ($this->sitesUri as $site_uri) {
+        $this->progress[] = $stage . '|' . $site_uri;
+      }
+    }
+    print_r($this->progress);
+
+  }
+
   /**
    * Prepares the sites for upgrade.
    *
@@ -58,18 +107,28 @@ class ContentHubUpgrade {
    *   Executes the upgrade from 1.x to 2.x
    */
   public function contentHubUpgrade() {
-    $this->getSiteFactorySites();
-    $this->removeRestResourceAndSetSchema();
-    $this->updateDbs();
-    $this->upgradePublishers();
-    $this->upgradeSubscribers();
+    $pid = $this->getStoredProgressId();
+
+    $this->removeRestResourceAndSetSchema($pid);
+    $this->updateDbs($pid);
+    if ($this->liftSupport) {
+      $this->enableAcquiaLiftSupportModule($pid);
+    }
+    $this->upgradePublishers($pid);
+    $this->upgradeSubscribers($pid);
+
+    $this->cleanUp();
   }
 
   /**
    * Removes REST resource and sets module schema to 8200..
    */
-  protected function removeRestResourceAndSetSchema() {
+  protected function removeRestResourceAndSetSchema($pid) {
     foreach ($this->sitesUri as $site_uri) {
+      $current_pid = $this->getProgressId(__METHOD__, $site_uri);
+      if ($pid && $current_pid < $pid) {
+        continue;
+      }
       $options = [
         'uri' => 'http://' . $site_uri,
         'root' => $this->docroot,
@@ -96,11 +155,18 @@ class ContentHubUpgrade {
         'drupal_set_installed_schema_version("acquia_contenthub","8200");',
       ];
       drush_invoke_process($this->alias, 'ev', $arguments, $options);
+
+      // Tracking progress.
+      $this->trackProgress(__METHOD__, $site_uri);
     }
   }
 
-  protected function updateDbs() {
+  protected function updateDbs($pid) {
     foreach ($this->sitesUri as $site_uri) {
+      $current_pid = $this->getProgressId(__METHOD__, $site_uri);
+      if ($pid && $current_pid < $pid) {
+        continue;
+      }
       $options = [
         'uri' => 'http://' . $site_uri,
         'yes' => true,
@@ -109,11 +175,40 @@ class ContentHubUpgrade {
       ];
       drush_print(sprintf('Running Database updates for site %s:', $site_uri));
       drush_invoke_process($this->alias, 'updb', $arguments, $options);
+
+      // Tracking progress.
+      $this->trackProgress(__METHOD__, $site_uri);
     }
   }
 
-  protected function upgradePublishers() {
+  protected function enableAcquiaLiftSupportModule($pid) {
     foreach ($this->sitesUri as $site_uri) {
+      $current_pid = $this->getProgressId(__METHOD__, $site_uri);
+      if ($pid && $current_pid < $pid) {
+        continue;
+      }
+      $arguments = [
+        'acquia_lift_support',
+      ];
+      $options = [
+        'uri' => 'http://' . $site_uri,
+        'yes' => true,
+      ];
+      $output = drush_invoke_process($this->alias, 'en', $arguments, $options);
+      if ($output['error_status'] === 0) {
+        drush_print(sprintf('Finished installation of acquia_lift_support module on site %s', $site_uri));
+      }
+      // Tracking progress.
+      $this->trackProgress(__METHOD__, $site_uri);
+    }
+  }
+
+  protected function upgradePublishers($pid) {
+    foreach ($this->sitesUri as $site_uri) {
+      $current_pid = $this->getProgressId(__METHOD__, $site_uri);
+      if ($pid && $current_pid < $pid) {
+        continue;
+      }
       $options = [
         'uri' => 'http://' . $site_uri,
         'root' => $this->docroot,
@@ -122,17 +217,46 @@ class ContentHubUpgrade {
         '$e = \Drupal::database()->query("SELECT count(*) as export FROM acquia_contenthub_entities_tracking WHERE status_export IS NOT NULL")->fetchAssoc(); $publisher = $e[\'export\'] ?? 0; if ($publisher) {  \Drupal::service("module_installer")->install(["acquia_contenthub_publisher"]);}',
       ];
 
-      drush_print(sprintf('Checking if site is publisher: %s:', $site_uri));
-      $output = drush_invoke_process($this->alias, 'ev', $arguments, $options);
+      drush_print(sprintf('If site is a publisher then enable publisher module for: %s:', $site_uri));
+      drush_invoke_process($this->alias, 'ev', $arguments, $options);
 
-      // If publisher then run upgrade.
-      drush_print(sprintf('Installing and upgrading publisher module in %s:', $site_uri));
-      drush_invoke_process($this->alias, 'ach-publisher-upgrade', [], $options);
+      // checking is acquia_contenthub_publisher module has been enabled.
+      $arguments = [
+      ];
+      $options = [
+        'uri' => 'http://' . $site_uri,
+        'status' => 'enabled',
+        'package' => 'Acquia Content Hub',
+      ];
+      $output = drush_invoke_process($this->alias, 'pml', $arguments, $options);
+      $modules = [
+        'acquia_contenthub_publisher',
+      ];
+      $publisher_enabled = array_intersect($modules, array_keys($output['object']));
+
+      if (!empty($publisher_enabled)) {
+        // If publisher then run upgrade.
+        $options = [
+          'uri' => 'http://' . $site_uri,
+          'root' => $this->docroot,
+        ];
+        drush_print(sprintf('Running upgrade for publisher module in site %s:', $site_uri));
+        drush_invoke_process($this->alias, 'ach-publisher-upgrade', [], $options);
+      }
+      else {
+        drush_print(sprintf('Site "%s" is not a publisher.', $site_uri));
+      }
+      // Tracking progress.
+      $this->trackProgress(__METHOD__, $site_uri);
     }
   }
 
-  protected function upgradeSubscribers() {
+  protected function upgradeSubscribers($pid) {
     foreach ($this->sitesUri as $site_uri) {
+      $current_pid = $this->getProgressId(__METHOD__, $site_uri);
+      if ($pid && $current_pid < $pid) {
+        continue;
+      }
       $options = [
         'uri' => 'http://' . $site_uri,
         'root' => $this->docroot,
@@ -141,6 +265,9 @@ class ContentHubUpgrade {
       // If subscriber then run upgrade.
       drush_print(sprintf('Upgrading subscriber module in %s:', $site_uri));
       drush_invoke_process($this->alias, 'ach-subscriber-upgrade', [], $options);
+
+      // Tracking progress.
+      $this->trackProgress(__METHOD__, $site_uri);
     }
   }
 }

@@ -13,6 +13,10 @@ namespace Drupal\ContentHubUpgradeCommands;
  */
 class ContentHubPrepareUpgrade  {
 
+  use ContentHubUpgradeProgressTrait;
+
+  const CONTENT_HUB_PREPARE_UPGRADE_PROGRESS_TRACKER_FILE = '/tmp/content-hub-prepare-upgrade-progress.tmp';
+
   /**
    * The environment drush alias.
    *
@@ -35,6 +39,17 @@ class ContentHubPrepareUpgrade  {
   protected $docroot;
 
   /**
+   * ContentHubUpgrade constructor.
+   *
+   * @throws \Exception
+   */
+  public function __construct() {
+    $this->getSiteFactorySites();
+    $this->buildProgressTracker();
+    $this->setProgressTrackerFile(self::CONTENT_HUB_PREPARE_UPGRADE_PROGRESS_TRACKER_FILE);
+  }
+
+  /**
    * Collects a list of Site Factory URIs and drush alias.
    */
   protected function getSiteFactorySites() {
@@ -48,6 +63,27 @@ class ContentHubPrepareUpgrade  {
     $this->docroot = "/var/www/html/{$sites['cloud']['site']}.{$sites['cloud']['env']}/docroot";
   }
 
+  public function buildProgressTracker() {
+    $stages = [
+      'uninstallUnNeededAchModules1x',
+      'installDepCalc',
+      'printWebhooksInformation',
+      'purgeSubscription',
+    ];
+
+    foreach ($stages as $key => $stage) {
+      foreach ($this->sitesUri as $site_uri) {
+        if ($key > 1) {
+          $this->progress[] = $stage;
+        }
+        else {
+          $this->progress[] = $stage . '|' . $site_uri;
+        }
+      }
+    }
+    print_r($this->progress);
+  }
+
   /**
    * Prepares the sites for upgrade.
    *
@@ -57,11 +93,12 @@ class ContentHubPrepareUpgrade  {
    *   Prepares the site in 1.x for upgrade to 2.x
    */
   public function contentHubPrepareUpgrade() {
-    $this->getSiteFactorySites();
-    $this->uninstallUnNeededAchModules1x();
-    $this->installDepCalc();
-    $this->printWebhooksInformation();
-    $this->purgeSubscription();
+    $pid = $this->getStoredProgressId();
+    $this->uninstallUnNeededAchModules1x($pid);
+    $this->installDepCalc($pid);
+    $this->printWebhooksInformation($pid);
+    $this->purgeSubscription($pid);
+    $this->cleanUp();
   }
 
   /**
@@ -72,8 +109,12 @@ class ContentHubPrepareUpgrade  {
    *   - acquia_contenthub_status
    *   - acquia_contenthub_diagnostic
    */
-  protected function uninstallUnNeededAchModules1x() {
+  protected function uninstallUnNeededAchModules1x($pid) {
     foreach ($this->sitesUri as $site_uri) {
+      $current_pid = $this->getProgressId(__METHOD__, $site_uri);
+      if ($pid && $current_pid < $pid) {
+        continue;
+      }
       $arguments = [
       ];
       $options = [
@@ -101,14 +142,20 @@ class ContentHubPrepareUpgrade  {
           drush_print(sprintf('Uninstalled module %s', $module_name));
         }
       }
+      // Tracking progress.
+      $this->trackProgress(__METHOD__, $site_uri);
     }
   }
 
   /**
    * Installs depcalc module.
    */
-  protected function installDepCalc() {
+  protected function installDepCalc($pid) {
     foreach ($this->sitesUri as $site_uri) {
+      $current_pid = $this->getProgressId(__METHOD__, $site_uri);
+      if ($pid && $current_pid < $pid) {
+        continue;
+      }
       $arguments = [
         'depcalc',
       ];
@@ -120,13 +167,21 @@ class ContentHubPrepareUpgrade  {
       if ($output['error_status'] === 0) {
         drush_print(sprintf('Installed depcalc module on site %s', $site_uri));
       }
+
+      // Tracking progress.
+      $this->trackProgress(__METHOD__, $site_uri);
     }
   }
 
   /**
    * Prints Webhook Information in the Content Hub Subscription.
    */
-  protected function printWebhooksInformation() {
+  protected function printWebhooksInformation($pid) {
+    $current_pid = $this->getProgressId(__METHOD__, NULL);
+    if ($pid && $current_pid < $pid) {
+      return;
+    }
+
     // Taking first site in the list.
     $site_uri = reset($this->sitesUri);
     $arguments = [
@@ -137,12 +192,20 @@ class ContentHubPrepareUpgrade  {
     ];
     drush_print('Webhook Information for this Subscription:');
     drush_invoke_process($this->alias, 'ev', $arguments, $options);
+
+    // Tracking progress.
+    $this->trackProgress(__METHOD__, NULL);
   }
 
   /**
    * Purges the Content Hub Subscription.
    */
-  protected function purgeSubscription() {
+  protected function purgeSubscription($pid) {
+    $current_pid = $this->getProgressId(__METHOD__, NULL);
+    if ($pid && $current_pid < $pid) {
+      return;
+    }
+
     // Taking first site in the list.
     $site_uri = reset($this->sitesUri);
     $arguments = [
@@ -153,5 +216,8 @@ class ContentHubPrepareUpgrade  {
     ];
     drush_print('Purging Content Hub Subscription:');
     drush_invoke_process($this->alias, 'ev', $arguments, $options);
+
+    // Tracking progress.
+    $this->trackProgress(__METHOD__, NULL);
   }
 }
