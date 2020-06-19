@@ -1,0 +1,6 @@
+services:
+  acquia_contenthub_ignore_config.ignore_config_entities:
+    class: Drupal\acquia_contenthub_ignore_config\EventSubscriber\DataTamper\LoadFromConfigEntity
+    arguments: ['@entity_type.manager']
+    tags:
+      - { name: event_subscriber }

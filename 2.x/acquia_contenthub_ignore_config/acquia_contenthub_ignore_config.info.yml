@@ -1,0 +1,6 @@
+name: Acquia ContentHub Ignore Config
+type: module
+description: Allows subscribers to prevent Acquia ContentHub from creating or updating config.
+core: 8.x
+dependencies:
+  - acquia_contenthub_subscriber
